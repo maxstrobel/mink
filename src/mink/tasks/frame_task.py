@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import numpy.typing as npt
 
 from ..configuration import Configuration
 from ..exceptions import TargetNotSet, TaskDefinitionError
 from ..lie import SE3
-from .task import Task
+from .task import Objective, Task
+
+try:
+    if os.environ.get("MINK_DISABLE_NATIVE", ""):
+        raise ImportError
+    from ..lie import _lie_ops_c as _native  # noqa: PLC0415
+except ImportError:
+    _native = None  # type: ignore[assignment]
 
 
 class FrameTask(Task):
@@ -136,6 +145,11 @@ class FrameTask(Task):
         transform_frame_to_world = configuration.get_transform_frame_to_world(
             self.frame_name, self.frame_type
         )
+        if _native is not None:
+            return _native.se3_rminus(
+                self.transform_target_to_world.wxyz_xyz,
+                transform_frame_to_world.wxyz_xyz,
+            )
         return self.transform_target_to_world.minus(transform_frame_to_world)
 
     def compute_jacobian(self, configuration: Configuration) -> np.ndarray:
@@ -154,10 +168,49 @@ class FrameTask(Task):
             raise TargetNotSet(self.__class__.__name__)
 
         jac = configuration.get_frame_jacobian(self.frame_name, self.frame_type)
+        transform_frame_to_world = configuration.get_transform_frame_to_world(
+            self.frame_name, self.frame_type
+        )
+        if _native is not None:
+            T_tb = _native.se3_inverse_multiply(
+                self.transform_target_to_world.wxyz_xyz,
+                transform_frame_to_world.wxyz_xyz,
+            )
+            return -_native.se3_jlog(T_tb) @ jac
+        T_tb = self.transform_target_to_world.inverse() @ transform_frame_to_world
+        return -T_tb.jlog() @ jac
+
+    def compute_qp_objective(self, configuration: Configuration) -> Objective:
+        r"""Compute the matrix-vector pair :math:`(H, c)` of the QP objective.
+
+        Overrides the base implementation to compute the frame transform once
+        and reuse it for both error and Jacobian computation.
+        """
+        if self.transform_target_to_world is None:
+            raise TargetNotSet(self.__class__.__name__)
 
         transform_frame_to_world = configuration.get_transform_frame_to_world(
             self.frame_name, self.frame_type
         )
+        jac = configuration.get_frame_jacobian(self.frame_name, self.frame_type)
 
-        T_tb = self.transform_target_to_world.inverse() @ transform_frame_to_world
-        return -T_tb.jlog() @ jac
+        if _native is not None:
+            target = self.transform_target_to_world.wxyz_xyz
+            frame = transform_frame_to_world.wxyz_xyz
+            error = _native.se3_rminus(target, frame)
+            T_tb = _native.se3_inverse_multiply(target, frame)
+            jacobian = -_native.se3_jlog(T_tb) @ jac
+        else:
+            error = self.transform_target_to_world.minus(transform_frame_to_world)
+            T_tb = self.transform_target_to_world.inverse() @ transform_frame_to_world
+            jacobian = -T_tb.jlog() @ jac
+
+        minus_gain_error = -self.gain * error
+        weight = np.diag(self.cost)
+        weighted_jacobian = weight @ jacobian
+        weighted_error = weight @ minus_gain_error
+        mu = self.lm_damping * weighted_error @ weighted_error
+        eye_tg = np.eye(configuration.model.nv)
+        H = weighted_jacobian.T @ weighted_jacobian + mu * eye_tg
+        c = -weighted_error.T @ weighted_jacobian
+        return Objective(H, c)

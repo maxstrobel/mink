@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Added
+
+- Native C extension (`_lie_ops_c`) for performance-critical Lie group operations, with automatic fallback to pure Python when unavailable.
+  - Fused SE3 operations: `se3_log`, `se3_rminus`, `se3_inverse_multiply`, `se3_jlog`, `se3_adjoint`, `se3_rotation_adjoint_from_xmat`.
+  - `FrameTask` and `RelativeFrameTask` use native ops when available, with shared `compute_qp_objective` override to avoid redundant transform computation.
+  - `Configuration.get_frame_jacobian` uses native adjoint computation from raw MuJoCo xmat.
+  - Set `MINK_DISABLE_NATIVE=1` to force the pure Python path.
+- Switch build backend to `scikit-build-core` for C extension support.
+- Vectorize `Configuration.check_limits` using precomputed joint indices and numpy operations.
+
 ## 1.0.0 - 2025-12-19
 
 ### Changed

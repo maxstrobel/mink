@@ -117,6 +117,58 @@ class TestConfiguration(absltest.TestCase):
         configuration.update(q=q)
         configuration.check_limits(safety_break=True)  # Should not raise.
 
+    def test_check_limits_lower_bound(self):
+        """Verify that exceeding the lower bound is detected."""
+        configuration = mink.Configuration(self.model, q=self.q_ref)
+        q = configuration.q.copy()
+        # Push first joint below its lower limit.
+        q[0] = self.model.jnt_range[0, 0] - 1.0
+        configuration.update(q=q)
+        with self.assertRaises(mink.NotWithinConfigurationLimits):
+            configuration.check_limits()
+
+    def test_check_limits_upper_bound(self):
+        """Verify that exceeding the upper bound is detected."""
+        configuration = mink.Configuration(self.model, q=self.q_ref)
+        q = configuration.q.copy()
+        # Push first joint above its upper limit.
+        q[0] = self.model.jnt_range[0, 1] + 1.0
+        configuration.update(q=q)
+        with self.assertRaises(mink.NotWithinConfigurationLimits):
+            configuration.check_limits()
+
+    def test_check_limits_within_tolerance(self):
+        """Values within tolerance should not raise."""
+        configuration = mink.Configuration(self.model, q=self.q_ref)
+        q = configuration.q.copy()
+        tol = 1e-6
+        # Just barely outside the range but within tolerance.
+        q[0] = self.model.jnt_range[0, 1] + tol * 0.5
+        configuration.update(q=q)
+        configuration.check_limits(tol=tol)  # Should not raise.
+
+    def test_check_limits_multiple_violations_no_safety_break(self):
+        """All violations should be logged when safety_break is False."""
+        configuration = mink.Configuration(self.model, q=self.q_ref)
+        q = configuration.q.copy()
+        # Push all joints out of bounds.
+        for jnt in range(self.model.njnt):
+            if self.model.jnt_limited[jnt]:
+                padr = self.model.jnt_qposadr[jnt]
+                q[padr] = self.model.jnt_range[jnt, 1] + 10.0
+        configuration.update(q=q)
+        # Should not raise, just log.
+        configuration.check_limits(safety_break=False)
+
+    def test_check_limits_at_exact_boundary(self):
+        """Values exactly at the boundary should not raise."""
+        configuration = mink.Configuration(self.model, q=self.q_ref)
+        q = configuration.q.copy()
+        q[0] = self.model.jnt_range[0, 0]
+        q[1] = self.model.jnt_range[1, 1]
+        configuration.update(q=q)
+        configuration.check_limits()  # Should not raise.
+
 
 if __name__ == "__main__":
     absltest.main()
