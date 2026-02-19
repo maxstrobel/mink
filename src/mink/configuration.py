@@ -8,6 +8,7 @@ system that can be attached to various parts of the robot, such as a body, geom,
 """
 
 import logging
+import os
 
 import mujoco
 import numpy as np
@@ -15,6 +16,13 @@ import numpy as np
 from . import constants as consts
 from . import exceptions
 from .lie import SE3, SO3
+
+try:
+    if os.environ.get("MINK_DISABLE_NATIVE", ""):
+        raise ImportError
+    from .lie import _lie_ops_c as _native  # noqa: PLC0415
+except ImportError:
+    _native = None  # type: ignore[assignment]
 
 
 class Configuration:
@@ -49,6 +57,17 @@ class Configuration:
         self.model = model
         self.data = mujoco.MjData(model)
         self._logger = logging.getLogger(__package__)
+
+        # Precompute limited joint indices for vectorized check_limits.
+        limited = model.jnt_limited.astype(bool)
+        limited &= model.jnt_type != mujoco.mjtJoint.mjJNT_FREE
+        self._limited_jnt_ids = np.where(limited)[0]
+        self._limited_qposadr = model.jnt_qposadr[self._limited_jnt_ids]
+        self._limited_range = model.jnt_range[self._limited_jnt_ids]
+
+        # Cached identity matrix for QP assembly.
+        self._eye_nv = np.eye(model.nv)
+
         self.update(q=q)
 
     def update(self, q: np.ndarray | None = None) -> None:
@@ -90,31 +109,33 @@ class Configuration:
             NotWithinConfigurationLimits: If the current configuration is outside
                 the joint limits.
         """
-        for jnt in range(self.model.njnt):
-            jnt_type = self.model.jnt_type[jnt]
-            if (
-                jnt_type == mujoco.mjtJoint.mjJNT_FREE
-                or not self.model.jnt_limited[jnt]
-            ):
-                continue
-            padr = self.model.jnt_qposadr[jnt]
-            qval = self.q[padr]
-            qmin = self.model.jnt_range[jnt, 0]
-            qmax = self.model.jnt_range[jnt, 1]
-            if qval < qmin - tol or qval > qmax + tol:
-                if safety_break:
-                    raise exceptions.NotWithinConfigurationLimits(
-                        joint_id=jnt,
-                        value=int(qval),
-                        lower=qmin,
-                        upper=qmax,
-                        model=self.model,
-                    )
-                else:
-                    self._logger.debug(
-                        f"Value {qval:.2f} at index {jnt} is outside of its limits: "
-                        f"[{qmin:.2f}, {qmax:.2f}]"
-                    )
+        if len(self._limited_jnt_ids) == 0:
+            return
+        qvals = self.data.qpos[self._limited_qposadr]
+        violations = (qvals < self._limited_range[:, 0] - tol) | (
+            qvals > self._limited_range[:, 1] + tol
+        )
+        if not violations.any():
+            return
+        if safety_break:
+            idx = int(np.argmax(violations))
+            jnt = int(self._limited_jnt_ids[idx])
+            raise exceptions.NotWithinConfigurationLimits(
+                joint_id=jnt,
+                value=int(qvals[idx]),
+                lower=self._limited_range[idx, 0],
+                upper=self._limited_range[idx, 1],
+                model=self.model,
+            )
+        for idx in np.where(violations)[0]:
+            jnt = int(self._limited_jnt_ids[idx])
+            qval = qvals[idx]
+            qmin = self._limited_range[idx, 0]
+            qmax = self._limited_range[idx, 1]
+            self._logger.debug(
+                f"Value {qval:.2f} at joint {jnt} is outside of its limits: "
+                f"[{qmin:.2f}, {qmax:.2f}]"
+            )
 
     def get_frame_jacobian(self, frame_name: str, frame_type: str) -> np.ndarray:
         r"""Compute the Jacobian matrix of a frame velocity.
@@ -134,18 +155,7 @@ class Configuration:
         Returns:
             Jacobian :math:`{}_B J_{WB}` of the frame.
         """
-        if frame_type not in consts.SUPPORTED_FRAMES:
-            raise exceptions.UnsupportedFrame(frame_type, consts.SUPPORTED_FRAMES)
-
-        frame_id = mujoco.mj_name2id(
-            self.model, consts.FRAME_TO_ENUM[frame_type], frame_name
-        )
-        if frame_id == -1:
-            raise exceptions.InvalidFrame(
-                frame_name=frame_name,
-                frame_type=frame_type,
-                model=self.model,
-            )
+        frame_id = self._resolve_frame_id(frame_name, frame_type)
 
         jac = np.empty((6, self.model.nv))
         jac_func = consts.FRAME_TO_JAC_FUNC[frame_type]
@@ -155,11 +165,43 @@ class Configuration:
         # aligned with the world frame. To obtain a jacobian expressed in the local
         # frame, aka body jacobian, we need to left-multiply by A[T_fw].
         xmat = getattr(self.data, consts.FRAME_TO_XMAT_ATTR[frame_type])[frame_id]
-        R_wf = SO3.from_matrix(xmat.reshape(3, 3))
-        A_fw = SE3.from_rotation(R_wf.inverse()).adjoint()
+        if _native is not None:
+            A_fw = _native.se3_rotation_adjoint_from_xmat(xmat)
+        else:
+            R_wf = SO3.from_matrix(xmat.reshape(3, 3))
+            A_fw = SE3.from_rotation(R_wf.inverse()).adjoint()
         jac = A_fw @ jac
 
         return jac
+
+    def _resolve_frame_id(self, frame_name: str, frame_type: str) -> int:
+        """Validate frame type and resolve name to ID."""
+        if frame_type not in consts.SUPPORTED_FRAMES:
+            raise exceptions.UnsupportedFrame(frame_type, consts.SUPPORTED_FRAMES)
+        frame_id = mujoco.mj_name2id(
+            self.model, consts.FRAME_TO_ENUM[frame_type], frame_name
+        )
+        if frame_id == -1:
+            raise exceptions.InvalidFrame(
+                frame_name=frame_name,
+                frame_type=frame_type,
+                model=self.model,
+            )
+        return frame_id
+
+    def _get_transform_frame_to_world_wxyz_xyz(
+        self, frame_name: str, frame_type: str
+    ) -> np.ndarray:
+        """Return the raw wxyz_xyz[7] array for a frame pose. Internal use."""
+        frame_id = self._resolve_frame_id(frame_name, frame_type)
+        xpos = getattr(self.data, consts.FRAME_TO_POS_ATTR[frame_type])[frame_id]
+        xmat = getattr(self.data, consts.FRAME_TO_XMAT_ATTR[frame_type])[frame_id]
+        if _native is not None:
+            return _native.xmat_xpos_to_wxyz_xyz(xmat, xpos)
+        return SE3.from_rotation_and_translation(
+            rotation=SO3.from_matrix(xmat.reshape(3, 3)),
+            translation=xpos,
+        ).wxyz_xyz
 
     def get_transform_frame_to_world(self, frame_name: str, frame_type: str) -> SE3:
         """Get the pose of a frame at the current configuration.
@@ -171,25 +213,25 @@ class Configuration:
         Returns:
             The pose of the frame in the world frame.
         """
-        if frame_type not in consts.SUPPORTED_FRAMES:
-            raise exceptions.UnsupportedFrame(frame_type, consts.SUPPORTED_FRAMES)
-
-        frame_id = mujoco.mj_name2id(
-            self.model, consts.FRAME_TO_ENUM[frame_type], frame_name
+        return SE3(
+            wxyz_xyz=self._get_transform_frame_to_world_wxyz_xyz(frame_name, frame_type)
         )
-        if frame_id == -1:
-            raise exceptions.InvalidFrame(
-                frame_name=frame_name,
-                frame_type=frame_type,
-                model=self.model,
-            )
 
-        xpos = getattr(self.data, consts.FRAME_TO_POS_ATTR[frame_type])[frame_id]
-        xmat = getattr(self.data, consts.FRAME_TO_XMAT_ATTR[frame_type])[frame_id]
-        return SE3.from_rotation_and_translation(
-            rotation=SO3.from_matrix(xmat.reshape(3, 3)),
-            translation=xpos,
-        )
+    def _get_transform_wxyz_xyz(
+        self,
+        source_name: str,
+        source_type: str,
+        dest_name: str,
+        dest_type: str,
+    ) -> np.ndarray:
+        """Return the raw wxyz_xyz[7] for a relative transform. Internal use."""
+        source = self._get_transform_frame_to_world_wxyz_xyz(source_name, source_type)
+        dest = self._get_transform_frame_to_world_wxyz_xyz(dest_name, dest_type)
+        if _native is not None:
+            return _native.se3_inverse_multiply(dest, source)
+        dest_se3 = SE3(wxyz_xyz=dest)
+        source_se3 = SE3(wxyz_xyz=source)
+        return (dest_se3.inverse() @ source_se3).wxyz_xyz
 
     def get_transform(
         self,
@@ -210,13 +252,11 @@ class Configuration:
         Returns:
             The pose of `source_name` in `dest_name`.
         """
-        transform_source_to_world = self.get_transform_frame_to_world(
-            source_name, source_type
+        return SE3(
+            wxyz_xyz=self._get_transform_wxyz_xyz(
+                source_name, source_type, dest_name, dest_type
+            )
         )
-        transform_dest_to_world = self.get_transform_frame_to_world(
-            dest_name, dest_type
-        )
-        return transform_dest_to_world.inverse() @ transform_source_to_world
 
     def integrate(self, velocity: np.ndarray, dt: float) -> np.ndarray:
         """Integrate a velocity starting from the current configuration.

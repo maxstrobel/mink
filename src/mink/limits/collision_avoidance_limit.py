@@ -1,7 +1,6 @@
 """Collision avoidance limit."""
 
 import itertools
-from dataclasses import dataclass
 from typing import Sequence
 
 import mujoco
@@ -17,59 +16,24 @@ CollisionPair = tuple[GeomSequence, GeomSequence]
 CollisionPairs = Sequence[CollisionPair]
 
 
-@dataclass(frozen=True)
-class Contact:
-    """Struct to store contact information between two geoms.
-
-    Attributes:
-        dist: Smallest signed distance between geom1 and geom2. If no collision of
-            distance smaller than distmax is found, this value is equal to distmax [1].
-        fromto: Segment connecting the closest points on geom1 and geom2. The first
-            three elements are the coordinates of the closest point on geom1, and the
-            last three elements are the coordinates of the closest point on geom2.
-        geom1: ID of geom1.
-        geom2: ID of geom2.
-        distmax: Maximum distance between geom1 and geom2.
-
-    References:
-        [1] MuJoCo API documentation. `mj_geomDistance` function.
-            https://mujoco.readthedocs.io/en/latest/APIreference/APIfunctions.html
-    """
-
-    dist: float
-    fromto: np.ndarray
-    geom1: int
-    geom2: int
-    distmax: float
-
-    @property
-    def normal(self) -> np.ndarray:
-        """Contact normal pointing from geom1 to geom2."""
-        normal = self.fromto[3:] - self.fromto[:3]
-        mujoco.mju_normalize3(normal)
-        return normal
-
-    @property
-    def inactive(self) -> bool:
-        """Returns True if no distance smaller than distmax is detected between geom1
-        and geom2."""
-        return bool(np.isclose(self.dist, self.distmax))
-
-
 def compute_contact_normal_jacobian(
     model: mujoco.MjModel,
     data: mujoco.MjData,
-    contact: Contact,
+    geom1_id: int,
+    geom2_id: int,
+    fromto: np.ndarray,
+    normal: np.ndarray,
+    jac1: np.ndarray,
+    jac2: np.ndarray,
 ) -> np.ndarray:
-    geom1_body = model.geom_bodyid[contact.geom1]
-    geom2_body = model.geom_bodyid[contact.geom2]
-    geom1_contact_pos = contact.fromto[:3]
-    geom2_contact_pos = contact.fromto[3:]
-    jac2 = np.empty((3, model.nv))
-    mujoco.mj_jac(model, data, jac2, None, geom2_contact_pos, geom2_body)
-    jac1 = np.empty((3, model.nv))
-    mujoco.mj_jac(model, data, jac1, None, geom1_contact_pos, geom1_body)
-    return contact.normal @ (jac2 - jac1)
+    """Compute the contact normal Jacobian between two geoms."""
+    normal[:] = fromto[3:] - fromto[:3]
+    mujoco.mju_normalize3(normal)
+    geom_bodyid = model.geom_bodyid
+    mujoco.mj_jac(model, data, jac2, None, fromto[3:], geom_bodyid[geom2_id])
+    mujoco.mj_jac(model, data, jac1, None, fromto[:3], geom_bodyid[geom1_id])
+    jac2 -= jac1
+    return normal @ jac2
 
 
 def _is_welded_together(model: mujoco.MjModel, geom_id1: int, geom_id2: int) -> bool:
@@ -184,50 +148,46 @@ class CollisionAvoidanceLimit(Limit):
         self.geom_id_pairs = self._construct_geom_id_pairs(geom_pairs)
         self.max_num_contacts = len(self.geom_id_pairs)
 
+        self._fromto = np.empty(6)
+        self._normal = np.empty(3)
+        self._jac1 = np.empty((3, model.nv))
+        self._jac2 = np.empty((3, model.nv))
+
     def compute_qp_inequalities(
         self,
         configuration: Configuration,
         dt: float,
     ) -> Constraint:
+        model = self.model
+        data = configuration.data
         upper_bound = np.full((self.max_num_contacts,), np.inf)
-        coefficient_matrix = np.zeros((self.max_num_contacts, self.model.nv))
+        coefficient_matrix = np.zeros((self.max_num_contacts, model.nv))
+        fromto = self._fromto
+        normal = self._normal
+        jac1 = self._jac1
+        jac2 = self._jac2
+        distmax = self.collision_detection_distance
+        min_dist = self.minimum_distance_from_collisions
+        gain = self.gain
+        relaxation = self.bound_relaxation
         for idx, (geom1_id, geom2_id) in enumerate(self.geom_id_pairs):
-            contact = self._compute_contact_with_minimum_distance(
-                configuration.data, geom1_id, geom2_id
+            dist = mujoco.mj_geomDistance(
+                model, data, geom1_id, geom2_id, distmax, fromto
             )
-            if contact.inactive:
+            if abs(dist - distmax) < 1e-12:
                 continue
-            hi_bound_dist = contact.dist
-            if hi_bound_dist > self.minimum_distance_from_collisions:
-                dist = hi_bound_dist - self.minimum_distance_from_collisions
-                upper_bound[idx] = (self.gain * dist / dt) + self.bound_relaxation
-            else:
-                upper_bound[idx] = self.bound_relaxation
-            jac = compute_contact_normal_jacobian(
-                self.model, configuration.data, contact
+            row = compute_contact_normal_jacobian(
+                model, data, geom1_id, geom2_id, fromto, normal, jac1, jac2
             )
-            sign = -1.0 if hi_bound_dist >= 0 else 1.0
-            coefficient_matrix[idx] = sign * jac
+            if dist > min_dist:
+                upper_bound[idx] = (gain * (dist - min_dist) / dt) + relaxation
+            else:
+                upper_bound[idx] = relaxation
+            sign = -1.0 if dist >= 0 else 1.0
+            coefficient_matrix[idx] = sign * row
         return Constraint(G=coefficient_matrix, h=upper_bound)
 
     # Private methods.
-
-    def _compute_contact_with_minimum_distance(
-        self, data: mujoco.MjData, geom1_id: int, geom2_id: int
-    ) -> Contact:
-        """Returns the smallest signed distance between a geom pair."""
-        fromto = np.empty(6)
-        dist = mujoco.mj_geomDistance(
-            self.model,
-            data,
-            geom1_id,
-            geom2_id,
-            self.collision_detection_distance,
-            fromto,
-        )
-        return Contact(
-            dist, fromto, geom1_id, geom2_id, self.collision_detection_distance
-        )
 
     def _homogenize_geom_id_list(self, geom_list: GeomSequence) -> list[int]:
         """Take a heterogeneous list of geoms (specified via ID or name) and return

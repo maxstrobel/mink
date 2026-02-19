@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import numpy.typing as npt
 
 from ..configuration import Configuration
 from ..exceptions import TargetNotSet, TaskDefinitionError
 from ..lie import SE3
-from .task import Task
+from .task import Objective, Task
+
+try:
+    if os.environ.get("MINK_DISABLE_NATIVE", ""):
+        raise ImportError
+    from ..lie import _lie_ops_c as _native  # noqa: PLC0415
+except ImportError:
+    _native = None  # type: ignore[assignment]
 
 
 class RelativeFrameTask(Task):
@@ -105,13 +114,13 @@ class RelativeFrameTask(Task):
         if self.transform_target_to_root is None:
             raise TargetNotSet(self.__class__.__name__)
 
-        transform_frame_to_root = configuration.get_transform(
-            self.frame_name,
-            self.frame_type,
-            self.root_name,
-            self.root_type,
+        frame = configuration._get_transform_wxyz_xyz(
+            self.frame_name, self.frame_type, self.root_name, self.root_type
         )
-        return transform_frame_to_root.rminus(self.transform_target_to_root)
+        target = self.transform_target_to_root.wxyz_xyz
+        if _native is not None:
+            return _native.se3_rminus(frame, target)
+        return SE3(wxyz_xyz=frame).rminus(SE3(wxyz_xyz=target))
 
     def compute_jacobian(self, configuration: Configuration) -> np.ndarray:
         if self.transform_target_to_root is None:
@@ -123,18 +132,60 @@ class RelativeFrameTask(Task):
         jacobian_root_in_root = configuration.get_frame_jacobian(
             self.root_name, self.root_type
         )
+        frame = configuration._get_transform_wxyz_xyz(
+            self.frame_name, self.frame_type, self.root_name, self.root_type
+        )
+        target = self.transform_target_to_root.wxyz_xyz
 
-        transform_frame_to_root = configuration.get_transform(
-            self.frame_name,
-            self.frame_type,
-            self.root_name,
-            self.root_type,
-        )
-        transform_frame_to_target = (
-            self.transform_target_to_root.inverse() @ transform_frame_to_root
-        )
+        if _native is not None:
+            T_ft = _native.se3_inverse_multiply(target, frame)
+            A_rf = _native.se3_adjoint(_native.se3_inverse(frame))
+            return _native.se3_jlog(T_ft) @ (
+                jacobian_frame_in_frame - A_rf @ jacobian_root_in_root
+            )
+        else:
+            frame_se3 = SE3(wxyz_xyz=frame)
+            target_se3 = SE3(wxyz_xyz=target)
+            transform_frame_to_target = target_se3.inverse() @ frame_se3
+            return transform_frame_to_target.jlog() @ (
+                jacobian_frame_in_frame
+                - frame_se3.inverse().adjoint() @ jacobian_root_in_root
+            )
 
-        return transform_frame_to_target.jlog() @ (
-            jacobian_frame_in_frame
-            - transform_frame_to_root.inverse().adjoint() @ jacobian_root_in_root
+    def compute_qp_objective(self, configuration: Configuration) -> Objective:
+        r"""Compute the matrix-vector pair :math:`(H, c)` of the QP objective.
+
+        Overrides the base implementation to compute shared quantities once.
+        """
+        if self.transform_target_to_root is None:
+            raise TargetNotSet(self.__class__.__name__)
+
+        jacobian_frame_in_frame = configuration.get_frame_jacobian(
+            self.frame_name, self.frame_type
         )
+        jacobian_root_in_root = configuration.get_frame_jacobian(
+            self.root_name, self.root_type
+        )
+        frame = configuration._get_transform_wxyz_xyz(
+            self.frame_name, self.frame_type, self.root_name, self.root_type
+        )
+        target = self.transform_target_to_root.wxyz_xyz
+
+        if _native is not None:
+            error = _native.se3_rminus(frame, target)
+            T_ft = _native.se3_inverse_multiply(target, frame)
+            A_rf = _native.se3_adjoint(_native.se3_inverse(frame))
+            jacobian = _native.se3_jlog(T_ft) @ (
+                jacobian_frame_in_frame - A_rf @ jacobian_root_in_root
+            )
+        else:
+            frame_se3 = SE3(wxyz_xyz=frame)
+            target_se3 = SE3(wxyz_xyz=target)
+            error = frame_se3.rminus(target_se3)
+            transform_frame_to_target = target_se3.inverse() @ frame_se3
+            jacobian = transform_frame_to_target.jlog() @ (
+                jacobian_frame_in_frame
+                - frame_se3.inverse().adjoint() @ jacobian_root_in_root
+            )
+
+        return self._assemble_qp(error, jacobian, configuration._eye_nv)

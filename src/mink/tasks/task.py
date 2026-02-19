@@ -120,6 +120,22 @@ class Task(BaseTask):
         """
         raise NotImplementedError
 
+    def _assemble_qp(
+        self,
+        error: np.ndarray,
+        jacobian: np.ndarray,
+        eye_nv: np.ndarray,
+    ) -> Objective:
+        """Assemble QP objective from task error and Jacobian."""
+        weighted_error = self.cost * (-self.gain * error)
+        weighted_jacobian = self.cost[:, None] * jacobian
+        mu = self.lm_damping * (weighted_error @ weighted_error)
+        H = weighted_jacobian.T @ weighted_jacobian
+        if mu > 0.0:
+            H = H + mu * eye_nv
+        c = -weighted_error @ weighted_jacobian
+        return Objective(H, c)
+
     def compute_qp_objective(self, configuration: Configuration) -> Objective:
         r"""Compute the matrix-vector pair :math:`(H, c)` of the QP objective.
 
@@ -140,17 +156,8 @@ class Task(BaseTask):
         Returns:
             Pair :math:`(H(q), c(q))`.
         """
-        jacobian = self.compute_jacobian(configuration)  # (k, nv)
-        minus_gain_error = -self.gain * self.compute_error(configuration)  # (k,)
-
-        weight = np.diag(self.cost)
-        weighted_jacobian = weight @ jacobian
-        weighted_error = weight @ minus_gain_error
-
-        mu = self.lm_damping * weighted_error @ weighted_error
-        eye_tg = np.eye(configuration.model.nv)
-
-        H = weighted_jacobian.T @ weighted_jacobian + mu * eye_tg  # (nv, nv)
-        c = -weighted_error.T @ weighted_jacobian  # (nv,)
-
-        return Objective(H, c)
+        return self._assemble_qp(
+            self.compute_error(configuration),
+            self.compute_jacobian(configuration),
+            configuration._eye_nv,
+        )
