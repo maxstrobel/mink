@@ -12,3 +12,8 @@ build/
 *.egg-info/
 *.so
 *.pyd
+.venv/
+.coverage
+.DS_Store
+.pytest_cache/
+.claude/

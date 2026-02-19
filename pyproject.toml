@@ -118,6 +118,7 @@ omit = [
 
 [tool.scikit-build]
 wheel.packages = ["src/mink"]
+sdist.exclude = ["examples", "benchmarks", "docs", "tests", "typings", "uv.lock"]
 
 [[tool.scikit-build.overrides]]
 if.failed = true
