@@ -9,10 +9,7 @@ from robot_descriptions.loaders.mujoco import load_robot_description
 
 from mink import Configuration
 from mink.limits import CollisionAvoidanceLimit
-from mink.limits.collision_avoidance_limit import (
-    Contact,
-    compute_contact_normal_jacobian,
-)
+from mink.limits.collision_avoidance_limit import compute_contact_normal_jacobian
 from mink.utils import get_body_geom_ids
 
 
@@ -165,19 +162,21 @@ class TestCollisionAvoidanceLimit(absltest.TestCase):
             efc_J = data.efc_J[start_idx:end_idx]
 
             # Compute the contact Jacobian manually.
-            normal = contact.frame[:3]
+            normal_dir = contact.frame[:3]
             dist = contact.dist
-            fromto = np.empty((6,), dtype=np.float64)
-            fromto[3:] = contact.pos - 0.5 * dist * normal
-            fromto[:3] = contact.pos + 0.5 * dist * normal
-            contact = Contact(
-                dist=contact.dist,
-                fromto=fromto,
-                geom1=contact.geom1,
-                geom2=contact.geom2,
-                distmax=np.inf,
+            fromto = np.empty(6, dtype=np.float64)
+            fromto[3:] = contact.pos - 0.5 * dist * normal_dir
+            fromto[:3] = contact.pos + 0.5 * dist * normal_dir
+            jac = compute_contact_normal_jacobian(
+                model,
+                data,
+                contact.geom1,
+                contact.geom2,
+                fromto,
+                np.empty(3),
+                np.empty((3, nv)),
+                np.empty((3, nv)),
             )
-            jac = compute_contact_normal_jacobian(model, data, contact)
 
             np.testing.assert_allclose(jac, efc_J, atol=1e-7)
 
