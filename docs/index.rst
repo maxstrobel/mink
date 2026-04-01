@@ -13,6 +13,10 @@ inverse kinematics built on top of the
    :align: center
    :width: 600px
 
+.. raw:: html
+
+   <br>
+
 It solves the following problem: given a robot's current configuration and a set of
 task-space objectives, compute a joint velocity that best satisfies those objectives
 while respecting constraints.
