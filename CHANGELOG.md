@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- `get_subtree_joint_ids` utility for retrieving all joints in the subtree rooted at a given body.
+- `get_subtree_joint_ids` utility for retrieving all joints in the subtree rooted at a given body. Contribution from @maxstrobel.
 
 ## [1.1.0] - 2026-02-19
 
