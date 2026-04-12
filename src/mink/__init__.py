@@ -46,4 +46,5 @@ from .utils import get_body_geom_ids as get_body_geom_ids
 from .utils import get_freejoint_dims as get_freejoint_dims
 from .utils import get_subtree_body_ids as get_subtree_body_ids
 from .utils import get_subtree_geom_ids as get_subtree_geom_ids
+from .utils import get_subtree_joint_ids as get_subtree_joint_ids
 from .utils import move_mocap_to_frame as move_mocap_to_frame

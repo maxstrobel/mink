@@ -202,6 +202,77 @@ class TestUtils(absltest.TestCase):
         expected_body_ids = [i for i in range(model.nbody)]
         self.assertSetEqual(set(actual_body_ids), set(expected_body_ids))
 
+    def test_get_subtree_joint_ids(self):
+        xml_str = """
+        <mujoco>
+          <worldbody>
+            <body name="b1" pos=".1 -.1 0">
+              <joint type="free" name="b1/free"/>
+              <geom name="b1/g1" type="sphere" size=".1" mass=".1"/>
+              <body name="b2">
+                <joint type="slide" name="b2/sx" axis="1 0 0"/>
+                <joint type="slide" name="b2/sy" axis="0 1 0"/>
+                <joint type="hinge" name="b2/hz" axis="0 0 1"/>
+                <geom name="b2/g1" type="sphere" size=".1" mass=".1"/>
+                <body name="b2a">
+                  <inertial pos="0 0 0" mass=".1" diaginertia="1 1 1"/>
+                  <body name="b2b">
+                    <joint type="hinge" name="b2b/hinge"/>
+                    <geom name="b2b/g1" type="sphere" size=".1" mass=".1"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+            <body name="b3" pos="1 1 1">
+              <joint type="free" name="b3/free"/>
+              <geom name="b3/g1" type="sphere" size=".1" mass=".1"/>
+              <body name="b4">
+                <joint type="hinge" name="b4/hinge" range="0 1.57" limited="true"/>
+                <geom name="b4/g1" type="sphere" size=".1" mass=".1"/>
+              </body>
+            </body>
+            <body name="jointless">
+              <inertial pos="0 0 0" mass=".1" diaginertia="1 1 1"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """
+        model = mujoco.MjModel.from_xml_string(xml_str)
+
+        # Subtree with a multi-joint body, a jointless intermediate body, and a
+        # deeper descendant. Sibling subtree (b3/b4) must be excluded.
+        b1_id = model.body("b1").id
+        actual = utils.get_subtree_joint_ids(model, b1_id)
+        expected = [
+            model.joint(n).id
+            for n in ["b1/free", "b2/sx", "b2/sy", "b2/hz", "b2b/hinge"]
+        ]
+        self.assertSetEqual(set(actual), set(expected))
+        for n in ["b3/free", "b4/hinge"]:
+            self.assertNotIn(model.joint(n).id, actual)
+
+        # Querying a body inside b1 returns only its own subtree.
+        b2_id = model.body("b2").id
+        actual = utils.get_subtree_joint_ids(model, b2_id)
+        expected = [model.joint(n).id for n in ["b2/sx", "b2/sy", "b2/hz", "b2b/hinge"]]
+        self.assertSetEqual(set(actual), set(expected))
+        self.assertNotIn(model.joint("b1/free").id, actual)
+
+        # Sibling subtree.
+        b3_id = model.body("b3").id
+        actual = utils.get_subtree_joint_ids(model, b3_id)
+        expected = [model.joint(n).id for n in ["b3/free", "b4/hinge"]]
+        self.assertSetEqual(set(actual), set(expected))
+
+        # Body with no joint anywhere in its subtree.
+        jointless_id = model.body("jointless").id
+        self.assertListEqual(utils.get_subtree_joint_ids(model, jointless_id), [])
+
+        # World root returns every joint.
+        world_id = 0
+        actual = utils.get_subtree_joint_ids(model, world_id)
+        self.assertSetEqual(set(actual), set(range(model.njnt)))
+
 
 if __name__ == "__main__":
     absltest.main()
